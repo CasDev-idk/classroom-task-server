@@ -30,8 +30,12 @@ const db = new sqlite3.Database(dbPath, (err) => {
     if (err) {
         console.error("Database initialization failed:", err.message);
     } else {
-        console.log("Successfully connected to SQLite cloud database.");
-        // Create schema with columns tracking image paths and structured AI outputs
+        console.log("Connected to SQLite cloud database.");
+        
+        // 🚨 ADD THIS LINE BELOW TO RESET THE FIX:
+        db.run(`DROP TABLE IF EXISTS tasks;`); 
+
+        // Now create the fresh production schema cleanly
         db.run(`CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
