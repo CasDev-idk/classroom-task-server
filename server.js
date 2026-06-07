@@ -9,7 +9,7 @@ const { GoogleGenAI } = require('@google/genai');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Initialize Gemini AI SDK
+// Initialize Gemini AI SDK securely using Render's environment vars
 const aiKey = process.env.GEMINI_API_KEY;
 const ai = aiKey ? new GoogleGenAI({ apiKey: aiKey }) : null;
 
@@ -17,21 +17,21 @@ const ai = aiKey ? new GoogleGenAI({ apiKey: aiKey }) : null;
 app.use(cors());
 app.use(express.json());
 
-// Ensure uploads directory exists
+// Ensure physical uploads directory exists on disk
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
 }
 app.use('/uploads', express.static(uploadsDir));
 
-// Database Path Selection
+// Select ephemeral storage location if hosted on production Render
 const dbPath = process.env.NODE_ENV === 'production' ? '/tmp/classroom_tasks.db' : './classroom_tasks.db';
 const db = new sqlite3.Database(dbPath, (err) => {
     if (err) console.error('Database connection error:', err.message);
     else console.log(`Connected to SQLite database at: ${dbPath}`);
 });
 
-// Structural initialization ensuring column parameters match isDone
+// Structural initialization matching correct data parameters
 db.serialize(() => {
     db.run(`
         CREATE TABLE IF NOT EXISTS tasks (
@@ -56,23 +56,14 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage: storage });
 
-function fileToGenerativePart(filePath, mimeType) {
-    return {
-        inlineData: {
-            data: Buffer.from(fs.readFileSync(filePath)).toString("base64"),
-            mimeType
-        },
-    };
-}
+// --- Endpoints ---
 
-// --- API Endpoints ---
-
-// Baseline placeholder route to clear out 404 response errors on standard hits
+// Main root route to stop browser tracking 404 response errors
 app.get('/', (req, res) => {
     res.send('Classroom Task Tracker Backend is Live and Running!');
 });
 
-// Fetch rows mapping isDone
+// Fetch tasks with safety data mapping parameters
 app.get('/api/tasks', (req, res) => {
     db.all("SELECT * FROM tasks ORDER BY createdAt DESC", [], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
@@ -80,12 +71,13 @@ app.get('/api/tasks', (req, res) => {
         const formattedRows = rows.map(row => ({
             ...row,
             _id: row.id, 
-            isDone: row.isDone === 1 // Mapping SQLite 1/0 to true/false
+            isDone: row.isDone === 1 
         }));
         res.json(formattedRows);
     });
 });
 
+// Submission Route parsing raw multipart uploads directly into the AI Engine
 app.post('/api/tasks', upload.single('image'), async (req, res) => {
     const { title, description, category } = req.body;
     const taskId = Date.now().toString();
@@ -104,18 +96,25 @@ app.post('/api/tasks', upload.single('image'), async (req, res) => {
 
             if (ai) {
                 try {
-                    const imagePart = fileToGenerativePart(req.file.path, req.file.mimetype);
-                    const prompt = "Analyze this classroom whiteboard photo or material. Extract text, summarize key assignments, tasks, or structural concepts clearly.";
+                    // Modern struct format explicitly for the newer genai framework requirements
+                    const imagePart = {
+                        inlineData: {
+                            data: fs.readFileSync(req.file.path).toString("base64"),
+                            mimeType: req.file.mimetype
+                        }
+                    };
+
+                    const promptText = "Analyze this classroom whiteboard photo or material. Extract text, summarize key assignments, tasks, or structural concepts clearly.";
                     
                     const response = await ai.models.generateContent({
                         model: 'gemini-2.5-flash',
-                        contents: [prompt, imagePart],
+                        contents: [promptText, imagePart],
                     });
                     
                     geminiAnalysis = response.text;
                 } catch (aiErr) {
-                    console.error("Gemini AI Processing failed:", aiErr.message);
-                    geminiAnalysis = "AI processing was skipped due to an engine error.";
+                    console.error("Gemini AI Processing failed details:", aiErr);
+                    geminiAnalysis = `AI processing skipped. Engine error: ${aiErr.message || aiErr}`;
                 }
             } else {
                 geminiAnalysis = "AI features unavailable (Missing API Key configuration).";
@@ -137,11 +136,12 @@ app.post('/api/tasks', upload.single('image'), async (req, res) => {
             isDone: false 
         });
     } catch (err) {
+        console.error("Route failure logs:", err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// Update Status tracking parameter corrected to isDone
+// Status update handling
 app.put('/api/tasks/:id', (req, res) => {
     const { isDone } = req.body;
     const numericStatus = isDone ? 1 : 0;
@@ -152,6 +152,7 @@ app.put('/api/tasks/:id', (req, res) => {
     });
 });
 
+// Task removal route
 app.delete('/api/tasks/:id', (req, res) => {
     db.get("SELECT imageUrl FROM tasks WHERE id = ?", [req.params.id], (err, row) => {
         if (row && row.imageUrl) {
