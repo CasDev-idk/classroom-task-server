@@ -12,12 +12,9 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@google/genai": "^2.8.0",
-    "@google/generative-ai": "^0.24.1",
+    "@google/genai": "^0.1.1",
     "cors": "^2.8.6",
-    "express": "^5.2.1",
-    "multer": "^2.1.1",
-    "sqlite3": "^6.0.1",
-    "uuid": "^14.0.0"
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "sqlite3": "^5.1.7"
   }
-}
