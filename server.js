@@ -1,179 +1,190 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
 const multer = require('multer');
+const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { GoogleGenAI } = require('@google/genai');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 3000;
 
-// 🌐 Middleware Configuration
+// Initialize Gemini AI SDK
+// Ensure GEMINI_API_KEY is set in your Render Environment Variables
+const aiKey = process.env.GEMINI_API_KEY;
+const ai = aiKey ? new GoogleGenAI({ apiKey: aiKey }) : null;
+
+// Middleware
 app.use(cors());
 app.use(express.json());
-// Serve uploaded images statically so the Flutter frontend can access them
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// 📁 Ensure local uploads storage folder exists securely
-if (!fs.existsSync('./uploads')) {
-    fs.mkdirSync('./uploads');
+// Ensure uploads directory exists locally (Render will clear this on restart, which is expected for ephemeral setups)
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
 }
+app.use('/uploads', express.static(uploadsDir));
 
-// 🗄️ Core SQLite Database Engine Initialization
-const db = new sqlite3.Database('./tasks.db', (err) => {
-    if (err) {
-        console.error("Failed to connect to local SQLite engine:", err.message);
-    } else {
-        console.log("Connected to SQLite database file container.");
-        // Ensure table includes the 'is_completed' checklist property column
-        db.run(`CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+// Database Setup
+// Note: On Render's free tier, standard disk files reset on redeploy. 
+// Using /opt/render/project/src/data/ or a persistent disk is ideal, but this fallback keeps it running safely.
+const dbPath = process.env.NODE_ENV === 'production' ? '/tmp/classroom_tasks.db' : './classroom_tasks.db';
+const db = new sqlite3.Database(dbPath, (err) => {
+    if (err) console.error('Database connection error:', err.message);
+    else console.log(`Connected to SQLite database at: ${dbPath}`);
+});
+
+// Initialize Tables
+db.serialize(() => {
+    db.run(`
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             description TEXT,
             category TEXT DEFAULT 'General',
-            image_url TEXT,
-            ai_analysis TEXT,
-            is_completed INTEGER DEFAULT 0
-        )`);
-    }
+            imageUrl TEXT,
+            geminiAnalysis TEXT,
+            isDone INTEGER DEFAULT 0,
+            createdAt TEXT
+        )
+    `);
 });
 
-// 🖼️ Multer Disk Storage Infrastructure for Image Ingestion
+// Multer Storage Configuration for File Streams
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
-        cb(null, 'uploads/');
+        cb(null, uploadsDir);
     },
     filename: (req, file, cb) => {
-        cb(null, Date.now() + path.extname(file.originalname));
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, uniqueSuffix + path.extname(file.originalname));
     }
 });
 const upload = multer({ storage: storage });
 
-// 📥 GET: Pull all tasks down into the layout feed
+// Helper function to convert a local file to a Generative Part object
+function fileToGenerativePart(filePath, mimeType) {
+    return {
+        inlineData: {
+            data: Buffer.from(fs.readFileSync(filePath)).toString("base64"),
+            mimeType
+        },
+    };
+}
+
+// --- API Endpoints ---
+
+// 1. GET ALL TASKS
 app.get('/api/tasks', (req, res) => {
-    db.all(`SELECT * FROM tasks ORDER BY id DESC`, [], (err, rows) => {
+    db.all("SELECT * FROM tasks ORDER BY createdAt DESC", [], (err, rows) => {
         if (err) {
             return res.status(500).json({ error: err.message });
         }
-        res.json({ tasks: rows });
+        // Map SQLite 1/0 to true/false for Flutter compatibility
+        const formattedRows = rows.map(row => ({
+            ...row,
+            _id: row.id, // Match the key Flutter expects
+            isDone: row.isDone === 1
+        }));
+        res.json(formattedRows);
     });
 });
 
-// 📤 POST: Receive new task payload and execute Gemini AI processing pipelines
+// 2. POST NEW TASK WITH OPTIONAL IMAGE & GEMINI AI ANALYSIS
 app.post('/api/tasks', upload.single('image'), async (req, res) => {
     const { title, description, category } = req.body;
+    const taskId = Date.now().toString();
+    const createdAt = new Date().toISOString();
+    
     let imageUrl = null;
-    let aiAnalysis = null;
+    let geminiAnalysis = null;
 
-    if (req.file) {
-        imageUrl = `/uploads/${req.file.filename}`;
-        const localImagePath = req.file.path;
-
-        try {
-            // Read binary photo file into a safe Base64 buffer string block
-            const imageBuffer = fs.readFileSync(localImagePath);
-            const base64Image = imageBuffer.toString("base64");
-
-            // 🚨 Check for Render Dashboard Environment Variables configuration
-            const apiKey = process.env.GEMINI_API_KEY;
-            
-            if (!apiKey) {
-                console.warn("WARNING: GEMINI_API_KEY environment variable is not defined on Render configuration layer.");
-                aiAnalysis = "AI Processing skipped: Backend server missing API key initialization.";
-            } else {
-                const genAI = new GoogleGenerativeAI(apiKey);
-                const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-
-                const prompt = "Analyze this classroom image. Transcribe any readable text, school tasks, or assignments, and provide a clear step-by-step breakdown or context explanation and solve any given problems on visable text/images.";
-
-                const result = await model.generateContent([
-                    prompt,
-                    {
-                        inlineData: {
-                            data: base64Image,
-                            mimeType: req.file.mimetype
-                        }
-                    }
-                ]);
-
-                aiAnalysis = result.response.text();
-            }
-        } catch (aiError) {
-            console.error("Gemini Engine Error Intercepted:", aiError.message);
-            // Fallback text so it cleanly finishes the operation instead of throwing a 500 error
-            aiAnalysis = `AI Processing paused: ${aiError.message}`;
-        }
+    if (!title) {
+        return res.status(400).json({ error: 'Title is required' });
     }
 
-    // Insert structural data safely into the database engine
-    const sql = `INSERT INTO tasks (title, description, category, image_url, ai_analysis, is_completed) VALUES (?, ?, ?, ?, ?, 0)`;
-    const params = [title, description, category || 'General', imageUrl, aiAnalysis];
+    try {
+        if (req.file) {
+            // Build absolute URL for the image based on how Render hosts it
+            const host = req.get('host');
+            const protocol = req.protocol;
+            imageUrl = `${protocol}://${host}/uploads/${req.file.filename}`;
 
-    db.run(sql, params, function (err) {
-        if (err) {
-            console.error("Database write crash encountered:", err.message);
-            return res.status(500).json({ error: err.message });
-        }
-        res.json({
-            message: "Task successfully synchronized and stored.",
-            taskId: this.lastID
-        });
-    });
-});
-
-// 🔄 PUT: Update task checklist completion state (Fixes Frontend Checkbox failures)
-app.put('/api/tasks/:id', (req, res) => {
-    const { id } = req.params;
-    const { is_completed } = req.body;
-
-    // Standardize incoming value safely into 0 or 1 integer profile for SQLite engine
-    const completedVal = is_completed == 1 || is_completed === true ? 1 : 0;
-
-    const sql = `UPDATE tasks SET is_completed = ? WHERE id = ?`;
-    
-    db.run(sql, [completedVal, id], function(err) {
-        if (err) {
-            console.error("Database failed to update status logic:", err.message);
-            return res.status(500).json({ error: err.message });
-        }
-        res.json({ message: "Task status synchronized successfully", updated: this.changes });
-    });
-});
-
-// 🗑️ DELETE: Purge task data row and unlink assets from disk storage
-app.delete('/api/tasks/:id', (req, res) => {
-    const { id } = req.params;
-
-    // Look up the file path first to prevent file orphans on disk
-    db.get(`SELECT image_url FROM tasks WHERE id = ?`, [id], (err, row) => {
-        if (err) {
-            return res.status(500).json({ error: err.message });
-        }
-
-        if (row && row.image_url) {
-            const absoluteFilePath = path.join(__dirname, row.image_url);
-            if (fs.existsSync(absoluteFilePath)) {
+            // Trigger Gemini Vision Analysis if SDK is active
+            if (ai) {
                 try {
-                    fs.unlinkSync(absoluteFilePath);
-                    console.log(`Cleaned up asset from storage file tree: ${row.image_url}`);
-                } catch (unlinkErr) {
-                    console.error("Failed to delete local asset file:", unlinkErr.message);
+                    const imagePart = fileToGenerativePart(req.file.path, req.file.mimetype);
+                    const prompt = "Analyze this classroom whiteboard photo or material. Extract text, summarize key assignments, tasks, or structural concepts clearly.";
+                    
+                    const response = await ai.models.generateContent({
+                        model: 'gemini-2.5-flash', // Utilizing strong standard flash pipeline
+                        contents: [prompt, imagePart],
+                    });
+                    
+                    geminiAnalysis = response.text;
+                } catch (aiErr) {
+                    console.error("Gemini AI Processing failed:", aiErr.message);
+                    geminiAnalysis = "AI processing was skipped due to an engine error.";
                 }
+            } else {
+                geminiAnalysis = "AI features unavailable (Missing API Key configuration).";
             }
         }
 
-        // Delete the database profile row completely
-        db.run(`DELETE FROM tasks WHERE id = ?`, [id], function (err) {
+        const stmt = db.prepare("INSERT INTO tasks (id, title, description, category, imageUrl, geminiAnalysis, isDone, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        stmt.run(taskId, title, description || '', category || 'General', imageUrl, geminiAnalysis, 0, createdAt);
+        stmt.finalize();
+
+        res.status(201).json({ 
+            id: taskId, 
+            _id: taskId,
+            title, 
+            description, 
+            category, 
+            imageUrl, 
+            geminiAnalysis, 
+            isDone: false 
+        });
+
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 3. PUT UPDATE STATUS (Toggle Checkbox)
+app.put('/api/tasks/:id', (req, res) => {
+    const { isDone } = req.body;
+    const numericStatus = isDone ? 1 : 0;
+
+    db.run("UPDATE tasks SET isDone = ? WHERE id = ?", [numericStatus, req.params.id], function(err) {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        res.json({ updated: this.changes });
+    });
+});
+
+// 4. DELETE A TASK
+app.delete('/api/tasks/:id', (req, res) => {
+    // Optional: First query row to delete the physical image file from 'uploads/' if it exists
+    db.get("SELECT imageUrl FROM tasks WHERE id = ?", [req.params.id], (err, row) => {
+        if (row && row.imageUrl) {
+            const filename = row.imageUrl.split('/uploads/')[1];
+            const fullPath = path.join(uploadsDir, filename);
+            if (fs.existsSync(fullPath)) {
+                fs.unlinkSync(fullPath); // Cleanup storage footprint
+            }
+        }
+        
+        db.run("DELETE FROM tasks WHERE id = ?", [req.params.id], function(err) {
             if (err) {
                 return res.status(500).json({ error: err.message });
             }
-            res.json({ message: "Task permanently deleted from ecosystem.", changes: this.changes });
+            res.json({ deleted: this.changes });
         });
     });
 });
 
-// ⚙️ Activate Application Execution Interface
 app.listen(PORT, () => {
-    console.log(`Ecosystem Server running securely on communication port: ${PORT}`);
+    console.log(`Server listening elegantly on port ${PORT}`);
 });
